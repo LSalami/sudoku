@@ -1,0 +1,58 @@
+@page
+@model IndexModel
+@{
+    ViewData["Title"] = "Sudoku 16x16 Solver";
+}
+
+<div class="container">
+    <h1>Risolutore Sudoku 16x16</h1>
+    <p class="subtitle">Valori: 1-9 e A-G (10-16), lascia vuoto per celle vuote</p>
+
+    <form method="post">
+        <div class="sudoku-grid">
+            @for (int row = 0; row < 16; row++)
+            {
+                <div class="sudoku-row @(row % 4 == 3 && row < 15 ? "box-border-bottom" : "")">
+                    @for (int col = 0; col < 16; col++)
+                    {
+                        var cellValue = Model.Grid[row, col];
+                        var displayValue = cellValue == 0 ? "" : (cellValue <= 9 ? cellValue.ToString() : ((char)('A' + cellValue - 10)).ToString());
+                        var isOriginal = Model.OriginalGrid[row, col] != 0;
+                        var cellClass = "sudoku-cell";
+                        if (col % 4 == 3 && col < 15) cellClass += " box-border-right";
+                        if (isOriginal && Model.IsSolved) cellClass += " original";
+                        if (!isOriginal && Model.IsSolved) cellClass += " solved";
+
+                        <input type="text"
+                               name="cells[@row][@col]"
+                               value="@displayValue"
+                               maxlength="1"
+                               class="@cellClass"
+                               @(Model.IsSolved ? "readonly" : "") />
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="buttons">
+            @if (!Model.IsSolved)
+            {
+                <button type="submit" asp-page-handler="Solve" class="btn btn-solve">Risolvi</button>
+                <button type="submit" asp-page-handler="Clear" class="btn btn-clear">Pulisci</button>
+                <button type="submit" asp-page-handler="Example" class="btn btn-example">Esempio 1</button>
+                <button type="submit" asp-page-handler="Example2" class="btn btn-test">Test Completo</button>
+            }
+            else
+            {
+                <button type="submit" asp-page-handler="Clear" class="btn btn-clear">Nuovo Puzzle</button>
+            }
+        </div>
+
+        @if (Model.Message != null)
+        {
+            <div class="message @(Model.IsError ? "error" : "success")">
+                @Model.Message
+            </div>
+        }
+    </form>
+</div>

@@ -1,0 +1,23 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v10.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v10.0": {
+      "Sudoku16x16Solver/1.0.0": {
+        "runtime": {
+          "Sudoku16x16Solver.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "Sudoku16x16Solver/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

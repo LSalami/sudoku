@@ -1,0 +1,838 @@
+@page "/"
+@rendermode InteractiveServer
+@inject IJSRuntime JS
+
+<div class="container" @ref="containerRef" tabindex="0" @onkeydown="HandleKeyDown">
+    <h1>Risolutore Sudoku 16x16</h1>
+    <p class="subtitle">Valori: 1-16 oppure A-G per 10-16, lascia vuoto per celle vuote</p>
+
+    <div class="sudoku-grid">
+        @for (int row = 0; row < 16; row++)
+        {
+            var r = row;
+            <div class="sudoku-row @(r % 4 == 3 && r < 15 ? "box-border-bottom" : "")">
+                @for (int col = 0; col < 16; col++)
+                {
+                    var c = col;
+                    var cellValue = Grid[r, c];
+                    var displayValue = cellValue == 0 ? "" : cellValue.ToString();
+                    var isOriginal = OriginalGrid[r, c] != 0;
+                    var isCurrentCell = (r == CurrentRow && c == CurrentCol);
+                    var cellClass = "sudoku-cell";
+                    if (c % 4 == 3 && c < 15) cellClass += " box-border-right";
+                    if (isOriginal) cellClass += " original";
+                    else if (cellValue != 0) cellClass += " solved";
+                    if (isCurrentCell && IsSolving) cellClass += " current";
+
+                    <input type="text"
+                           id="cell-@r-@c"
+                           value="@displayValue"
+                           maxlength="2"
+                           class="@cellClass"
+                           disabled="@IsSolving"
+                           @onfocus="() => OnCellFocus(r, c)"
+                           @onchange="e => OnCellChange(r, c, e.Value?.ToString())" />
+                }
+            </div>
+        }
+    </div>
+
+    <div class="algorithm-toggle">
+        <label>Algoritmo: </label>
+        <select @bind="SelectedAlgorithm" disabled="@IsSolving">
+            <option value="0">Standard (Backtracking + MRV)</option>
+            <option value="1">Avanzato (+ Naked Pairs, Pointing)</option>
+            <option value="2">DLX (Dancing Links - Velocissimo)</option>
+        </select>
+    </div>
+
+    <div class="speed-control">
+        <label>Velocità: </label>
+        <input type="range" min="1" max="100" @bind="Speed" @bind:event="oninput" />
+        <span>@Speed%</span>
+        @if (IsSolving)
+        {
+            <span class="steps-count">Passi: @StepCount</span>
+        }
+    </div>
+
+    <div class="buttons">
+        @if (!IsSolving)
+        {
+            <button class="btn btn-solve" @onclick="SolveAnimated">Risolvi</button>
+            <button class="btn btn-clear" @onclick="Clear">Pulisci</button>
+            <button class="btn btn-example" @onclick="LoadExample1">Esempio 1</button>
+            <button class="btn btn-test" @onclick="LoadExample2">Test Completo</button>
+            <a href="/samurai" class="btn btn-samurai">Samurai</a>
+        }
+        else
+        {
+            <button class="btn btn-clear" @onclick="StopSolving">Stop</button>
+        }
+    </div>
+
+    <div class="save-load-section">
+        <div class="save-puzzle">
+            <input type="text" @bind="SaveName" placeholder="Nome puzzle..." class="save-input" />
+            <button class="btn btn-save" @onclick="SaveCurrentPuzzle" disabled="@IsSolving">Salva</button>
+            <button class="btn btn-export" @onclick="ExportPuzzle" disabled="@IsSolving">Esporta</button>
+            <button class="btn btn-import" @onclick="TriggerImport" disabled="@IsSolving">Importa</button>
+            <input type="file" id="fileInput" accept=".json" style="display:none" @onchange="ImportPuzzle" />
+        </div>
+        @if (SavedPuzzles.Count > 0)
+        {
+            <div class="saved-puzzles">
+                <label>Puzzle salvati:</label>
+                <select @bind="SelectedPuzzleKey" class="puzzle-select">
+                    <option value="">-- Seleziona --</option>
+                    @foreach (var puzzle in SavedPuzzles)
+                    {
+                        <option value="@puzzle.Key">@puzzle.Name (@puzzle.Date.ToLocalTime().ToString("dd/MM HH:mm"))</option>
+                    }
+                </select>
+                <button class="btn btn-load" @onclick="LoadSelectedPuzzle" disabled="@(string.IsNullOrEmpty(SelectedPuzzleKey) || IsSolving)">Carica</button>
+                <button class="btn btn-delete" @onclick="DeleteSelectedPuzzle" disabled="@(string.IsNullOrEmpty(SelectedPuzzleKey) || IsSolving)">Elimina</button>
+            </div>
+        }
+    </div>
+
+    @if (Message != null)
+    {
+        <div class="message @(IsError ? "error" : "success")">
+            @Message
+        </div>
+    }
+</div>
+
+@code {
+    private int[,] Grid = new int[16, 16];
+    private int[,] OriginalGrid = new int[16, 16];
+    private bool IsSolving = false;
+    private bool StopRequested = false;
+    private string? Message = null;
+    private bool IsError = false;
+    private int CurrentRow = -1;
+    private int CurrentCol = -1;
+    private int Speed = 50;
+    private int StepCount = 0;
+    private int SelectedAlgorithm = 1; // Default: Avanzato
+    private ElementReference containerRef;
+    private int FocusedRow = 0;
+    private int FocusedCol = 0;
+
+    // Salvataggio puzzle
+    private string SaveName = "";
+    private string SelectedPuzzleKey = "";
+    private List<SavedPuzzleInfo> SavedPuzzles = new();
+
+    private int[] RowMasks = new int[Size];
+    private int[] ColMasks = new int[Size];
+    private int[] BoxMasks = new int[Size];
+    private int[,] CellMasks = new int[Size, Size];
+
+    private const int Size = 16;
+    private const int BoxSize = 4;
+    private static readonly int AllNumbersMask = (1 << (Size + 1)) - 2;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            await RefreshSavedPuzzlesList();
+            StateHasChanged();
+        }
+    }
+
+    private record SavedPuzzleInfo(string Key, string Name, DateTime Date);
+
+    private void OnCellChange(int row, int col, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) { Grid[row, col] = 0; return; }
+        var v = value.Trim().ToUpper();
+        if (int.TryParse(v, out int number))
+            Grid[row, col] = (number >= 1 && number <= Size) ? number : 0;
+        else if (v.Length == 1 && v[0] >= 'A' && v[0] <= 'G')
+            Grid[row, col] = v[0] - 'A' + 10;
+        else
+            Grid[row, col] = 0;
+    }
+
+    private void OnCellFocus(int row, int col)
+    {
+        FocusedRow = row;
+        FocusedCol = col;
+    }
+
+    private async Task HandleKeyDown(KeyboardEventArgs e)
+    {
+        if (IsSolving) return;
+
+        int newRow = FocusedRow;
+        int newCol = FocusedCol;
+
+        switch (e.Key)
+        {
+            case "ArrowUp":
+                newRow = (FocusedRow - 1 + Size) % Size;
+                break;
+            case "ArrowDown":
+                newRow = (FocusedRow + 1) % Size;
+                break;
+            case "ArrowLeft":
+                newCol = (FocusedCol - 1 + Size) % Size;
+                break;
+            case "ArrowRight":
+                newCol = (FocusedCol + 1) % Size;
+                break;
+            default:
+                return;
+        }
+
+        FocusedRow = newRow;
+        FocusedCol = newCol;
+        await JS.InvokeVoidAsync("focusCell", newRow, newCol);
+    }
+
+    private async Task SolveAnimated()
+    {
+        Message = null;
+        IsSolving = true;
+        StopRequested = false;
+        StepCount = 0;
+        Array.Copy(Grid, OriginalGrid, Grid.Length);
+
+        if (!InitializeMasks())
+        {
+            Message = "La griglia iniziale contiene conflitti.";
+            IsError = true;
+            IsSolving = false;
+            return;
+        }
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        bool solved;
+
+        if (SelectedAlgorithm == 2)
+        {
+            // DLX - risolve istantaneamente senza animazione
+            solved = SolveDLX();
+            StateHasChanged();
+        }
+        else
+        {
+            // Inizializza CellMasks
+            for (int row = 0; row < Size; row++)
+                for (int col = 0; col < Size; col++)
+                    if (Grid[row, col] == 0)
+                        CellMasks[row, col] = GetAvailableMask(row, col);
+                    else
+                        CellMasks[row, col] = 0;
+
+            StateHasChanged();
+            await Task.Delay(1);
+
+            solved = await SolveWithAnimation();
+        }
+
+        stopwatch.Stop();
+        CurrentRow = -1;
+        CurrentCol = -1;
+        IsSolving = false;
+
+        string algoName = SelectedAlgorithm switch { 0 => "Standard", 1 => "Avanzato", _ => "DLX" };
+
+        if (StopRequested)
+        {
+            Message = $"[{algoName}] Interrotto dopo {StepCount} passi";
+            IsError = true;
+        }
+        else if (solved)
+        {
+            Message = $"[{algoName}] Risolto in {stopwatch.ElapsedMilliseconds} ms ({StepCount} passi)!";
+            IsError = false;
+        }
+        else
+        {
+            Message = "Nessuna soluzione trovata.";
+            IsError = true;
+        }
+    }
+
+    // ==================== PROPAGAZIONE AVANZATA ====================
+
+    private bool PropagateConstraints(bool useAdvanced)
+    {
+        // Ricalcola tutti i CellMasks dalle celle vuote
+        for (int row = 0; row < Size; row++)
+            for (int col = 0; col < Size; col++)
+                CellMasks[row, col] = Grid[row, col] == 0 ? GetAvailableMask(row, col) : 0;
+
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+
+            // Naked Singles: celle con un solo candidato
+            for (int row = 0; row < Size; row++)
+                for (int col = 0; col < Size; col++)
+                {
+                    if (Grid[row, col] != 0) continue;
+                    int mask = CellMasks[row, col];
+                    if (mask == 0) return false; // Impossibile
+                    if (CountBits(mask) == 1)
+                    {
+                        SetNumberWithPropagation(row, col, GetSingleBit(mask));
+                        changed = true;
+                    }
+                }
+
+            // Hidden Singles: numeri che possono andare in un solo posto
+            for (int i = 0; i < Size; i++)
+            {
+                // Righe
+                for (int num = 1; num <= Size; num++)
+                {
+                    if ((RowMasks[i] & (1 << num)) != 0) continue;
+                    int count = 0, lastCol = -1;
+                    for (int col = 0; col < Size; col++)
+                        if (Grid[i, col] == 0 && (CellMasks[i, col] & (1 << num)) != 0) { count++; lastCol = col; }
+                    if (count == 0) return false;
+                    if (count == 1 && Grid[i, lastCol] == 0) { SetNumberWithPropagation(i, lastCol, num); changed = true; }
+                }
+
+                // Colonne
+                for (int num = 1; num <= Size; num++)
+                {
+                    if ((ColMasks[i] & (1 << num)) != 0) continue;
+                    int count = 0, lastRow = -1;
+                    for (int row = 0; row < Size; row++)
+                        if (Grid[row, i] == 0 && (CellMasks[row, i] & (1 << num)) != 0) { count++; lastRow = row; }
+                    if (count == 0) return false;
+                    if (count == 1 && Grid[lastRow, i] == 0) { SetNumberWithPropagation(lastRow, i, num); changed = true; }
+                }
+
+                // Box
+                int boxStartRow = (i / BoxSize) * BoxSize;
+                int boxStartCol = (i % BoxSize) * BoxSize;
+                for (int num = 1; num <= Size; num++)
+                {
+                    if ((BoxMasks[i] & (1 << num)) != 0) continue;
+                    int count = 0, lastR = -1, lastC = -1;
+                    for (int dr = 0; dr < BoxSize; dr++)
+                        for (int dc = 0; dc < BoxSize; dc++)
+                        {
+                            int r = boxStartRow + dr, c = boxStartCol + dc;
+                            if (Grid[r, c] == 0 && (CellMasks[r, c] & (1 << num)) != 0) { count++; lastR = r; lastC = c; }
+                        }
+                    if (count == 0) return false;
+                    if (count == 1 && Grid[lastR, lastC] == 0) { SetNumberWithPropagation(lastR, lastC, num); changed = true; }
+                }
+            }
+
+            // Ricalcola CellMasks dopo ogni ciclo
+            if (changed)
+            {
+                for (int row = 0; row < Size; row++)
+                    for (int col = 0; col < Size; col++)
+                        CellMasks[row, col] = Grid[row, col] == 0 ? GetAvailableMask(row, col) : 0;
+            }
+        }
+        return true;
+    }
+
+    private void ApplyNakedPairs(ref bool changed)
+    {
+        // Naked Pairs in righe
+        for (int row = 0; row < Size; row++)
+        {
+            var pairs = new List<(int col, int mask)>();
+            for (int col = 0; col < Size; col++)
+                if (Grid[row, col] == 0 && CountBits(CellMasks[row, col]) == 2)
+                    pairs.Add((col, CellMasks[row, col]));
+
+            for (int i = 0; i < pairs.Count; i++)
+                for (int j = i + 1; j < pairs.Count; j++)
+                    if (pairs[i].mask == pairs[j].mask)
+                    {
+                        int pairMask = pairs[i].mask;
+                        for (int col = 0; col < Size; col++)
+                            if (col != pairs[i].col && col != pairs[j].col && Grid[row, col] == 0)
+                            {
+                                int oldMask = CellMasks[row, col];
+                                CellMasks[row, col] &= ~pairMask;
+                                if (CellMasks[row, col] != oldMask) changed = true;
+                            }
+                    }
+        }
+
+        // Naked Pairs in colonne
+        for (int col = 0; col < Size; col++)
+        {
+            var pairs = new List<(int row, int mask)>();
+            for (int row = 0; row < Size; row++)
+                if (Grid[row, col] == 0 && CountBits(CellMasks[row, col]) == 2)
+                    pairs.Add((row, CellMasks[row, col]));
+
+            for (int i = 0; i < pairs.Count; i++)
+                for (int j = i + 1; j < pairs.Count; j++)
+                    if (pairs[i].mask == pairs[j].mask)
+                    {
+                        int pairMask = pairs[i].mask;
+                        for (int row = 0; row < Size; row++)
+                            if (row != pairs[i].row && row != pairs[j].row && Grid[row, col] == 0)
+                            {
+                                int oldMask = CellMasks[row, col];
+                                CellMasks[row, col] &= ~pairMask;
+                                if (CellMasks[row, col] != oldMask) changed = true;
+                            }
+                    }
+        }
+    }
+
+    private void ApplyPointingPairs(ref bool changed)
+    {
+        for (int box = 0; box < Size; box++)
+        {
+            int boxStartRow = (box / BoxSize) * BoxSize;
+            int boxStartCol = (box % BoxSize) * BoxSize;
+
+            for (int num = 1; num <= Size; num++)
+            {
+                if ((BoxMasks[box] & (1 << num)) != 0) continue;
+
+                int rowMask = 0, colMask = 0;
+                for (int dr = 0; dr < BoxSize; dr++)
+                    for (int dc = 0; dc < BoxSize; dc++)
+                    {
+                        int r = boxStartRow + dr, c = boxStartCol + dc;
+                        if (Grid[r, c] == 0 && (CellMasks[r, c] & (1 << num)) != 0)
+                        {
+                            rowMask |= (1 << r);
+                            colMask |= (1 << c);
+                        }
+                    }
+
+                // Se il numero appare solo in una riga del box
+                if (CountBits(rowMask) == 1)
+                {
+                    int row = GetSingleBit(rowMask) - 1;
+                    for (int col = 0; col < Size; col++)
+                        if (col < boxStartCol || col >= boxStartCol + BoxSize)
+                            if (Grid[row, col] == 0 && (CellMasks[row, col] & (1 << num)) != 0)
+                            {
+                                CellMasks[row, col] &= ~(1 << num);
+                                changed = true;
+                            }
+                }
+
+                // Se il numero appare solo in una colonna del box
+                if (CountBits(colMask) == 1)
+                {
+                    int col = GetSingleBit(colMask) - 1;
+                    for (int row = 0; row < Size; row++)
+                        if (row < boxStartRow || row >= boxStartRow + BoxSize)
+                            if (Grid[row, col] == 0 && (CellMasks[row, col] & (1 << num)) != 0)
+                            {
+                                CellMasks[row, col] &= ~(1 << num);
+                                changed = true;
+                            }
+                }
+            }
+        }
+    }
+
+    // ==================== BACKTRACKING CON ANIMAZIONE ====================
+
+    private async Task<bool> SolveWithAnimation()
+    {
+        if (StopRequested) return false;
+
+        var nextCell = FindBestCell();
+        if (nextCell == null) return true; // Tutte le celle riempite = successo
+
+        int row = nextCell.Value.Row;
+        int col = nextCell.Value.Col;
+        int mask = nextCell.Value.Mask;
+
+        if (mask == 0) return false; // Nessun candidato = fallimento
+
+        CurrentRow = row;
+        CurrentCol = col;
+
+        foreach (var num in EnumerateCandidates(mask))
+        {
+            if (StopRequested) return false;
+            StepCount++;
+
+            // Salva stato completo per backtrack
+            var savedGrid = (int[,])Grid.Clone();
+            var savedCellMasks = (int[,])CellMasks.Clone();
+            var savedRowMasks = (int[])RowMasks.Clone();
+            var savedColMasks = (int[])ColMasks.Clone();
+            var savedBoxMasks = (int[])BoxMasks.Clone();
+
+            SetNumberWithPropagation(row, col, num);
+
+            // Propaga dopo inserimento (solo per algoritmo Avanzato)
+            bool valid = true;
+            if (SelectedAlgorithm >= 1)
+                valid = PropagateConstraints(true);
+
+            int delay = Math.Max(1, (int)(100 * (1.0 - Speed / 100.0)));
+            await Task.Delay(delay);
+            StateHasChanged();
+
+            if (valid && await SolveWithAnimation())
+                return true;
+
+            // Backtrack completo
+            Grid = savedGrid;
+            CellMasks = savedCellMasks;
+            RowMasks = savedRowMasks;
+            ColMasks = savedColMasks;
+            BoxMasks = savedBoxMasks;
+
+            if (Speed < 95)
+            {
+                await Task.Delay(delay / 2);
+                StateHasChanged();
+            }
+        }
+
+        return false;
+    }
+
+    // ==================== DANCING LINKS (DLX) ====================
+
+    private bool SolveDLX()
+    {
+        var dlx = new DancingLinks(Size, BoxSize);
+
+        // Aggiungi vincoli esistenti
+        for (int row = 0; row < Size; row++)
+            for (int col = 0; col < Size; col++)
+                if (Grid[row, col] != 0)
+                    dlx.Cover(row, col, Grid[row, col]);
+
+        var solution = new List<(int row, int col, int num)>();
+        if (dlx.Solve(solution))
+        {
+            foreach (var (r, c, n) in solution)
+                if (Grid[r, c] == 0)
+                    Grid[r, c] = n;
+            StepCount = solution.Count;
+            return true;
+        }
+        return false;
+    }
+
+    // ==================== HELPER METHODS ====================
+
+    private bool InitializeMasks()
+    {
+        RowMasks = new int[Size];
+        ColMasks = new int[Size];
+        BoxMasks = new int[Size];
+        CellMasks = new int[Size, Size];
+
+        for (int row = 0; row < Size; row++)
+            for (int col = 0; col < Size; col++)
+                CellMasks[row, col] = AllNumbersMask;
+
+        for (int row = 0; row < Size; row++)
+            for (int col = 0; col < Size; col++)
+            {
+                int num = Grid[row, col];
+                if (num == 0) continue;
+                int bit = 1 << num;
+                int box = GetBoxIndex(row, col);
+                if ((RowMasks[row] & bit) != 0 || (ColMasks[col] & bit) != 0 || (BoxMasks[box] & bit) != 0)
+                    return false;
+                RowMasks[row] |= bit;
+                ColMasks[col] |= bit;
+                BoxMasks[box] |= bit;
+                CellMasks[row, col] = 0;
+            }
+        return true;
+    }
+
+    private void SetNumberWithPropagation(int row, int col, int num)
+    {
+        Grid[row, col] = num;
+        int bit = 1 << num;
+        int box = GetBoxIndex(row, col);
+        RowMasks[row] |= bit;
+        ColMasks[col] |= bit;
+        BoxMasks[box] |= bit;
+        CellMasks[row, col] = 0;
+
+        for (int i = 0; i < Size; i++)
+        {
+            CellMasks[row, i] &= ~bit;
+            CellMasks[i, col] &= ~bit;
+        }
+        int boxStartRow = (row / BoxSize) * BoxSize;
+        int boxStartCol = (col / BoxSize) * BoxSize;
+        for (int dr = 0; dr < BoxSize; dr++)
+            for (int dc = 0; dc < BoxSize; dc++)
+                CellMasks[boxStartRow + dr, boxStartCol + dc] &= ~bit;
+    }
+
+    private (int Row, int Col, int Mask)? FindBestCell()
+    {
+        int bestCount = int.MaxValue;
+        (int Row, int Col, int Mask)? best = null;
+
+        for (int row = 0; row < Size; row++)
+            for (int col = 0; col < Size; col++)
+            {
+                if (Grid[row, col] != 0) continue;
+                int mask = CellMasks[row, col];
+                int count = CountBits(mask);
+                if (count == 0) return (row, col, 0);
+                if (count < bestCount) { bestCount = count; best = (row, col, mask); if (count == 1) return best; }
+            }
+        return best;
+    }
+
+    private int GetAvailableMask(int row, int col)
+    {
+        int box = GetBoxIndex(row, col);
+        return (~(RowMasks[row] | ColMasks[col] | BoxMasks[box])) & AllNumbersMask;
+    }
+
+    private static int CountBits(int v) { int c = 0; while (v != 0) { v &= v - 1; c++; } return c; }
+    private static int GetSingleBit(int m) { for (int i = 1; i <= Size; i++) if ((m & (1 << i)) != 0) return i; return 0; }
+    private static IEnumerable<int> EnumerateCandidates(int m) { for (int n = 1; n <= Size; n++) if ((m & (1 << n)) != 0) yield return n; }
+    private static int GetBoxIndex(int r, int c) => (r / BoxSize) * BoxSize + (c / BoxSize);
+
+    private void StopSolving() => StopRequested = true;
+    private void Clear() { Grid = new int[16, 16]; OriginalGrid = new int[16, 16]; Message = null; }
+
+    private void LoadExample1()
+    {
+        Grid = new int[16, 16]
+        {
+            { 1, 2, 3, 4,  5, 6, 7, 8,  9,10,11,12, 13,14,15,16},
+            { 0, 0, 7, 0,  0,10, 0, 0, 13, 0, 0,16,  0, 0, 3, 0},
+            { 0,10, 0, 0, 13, 0, 0,16,  0, 0, 3, 0,  0, 6, 0, 0},
+            {13, 0, 0,16,  0, 0, 3, 0,  0, 6, 0, 0,  9, 0, 0,12},
+            { 2, 3, 4, 5,  6, 7, 8, 9, 10,11,12,13, 14,15,16, 1},
+            { 0, 7, 0, 0, 10, 0, 0,13,  0, 0,16, 0,  0, 3, 0, 0},
+            {10, 0, 0,13,  0, 0,16, 0,  0, 3, 0, 0,  6, 0, 0, 9},
+            { 0, 0,16, 0,  0, 3, 0, 0,  6, 0, 0, 9,  0, 0,12, 0},
+            { 3, 4, 5, 6,  7, 8, 9,10, 11,12,13,14, 15,16, 1, 2},
+            { 7, 0, 0,10,  0, 0,13, 0,  0,16, 0, 0,  3, 0, 0, 6},
+            { 0, 0,13, 0,  0,16, 0, 0,  3, 0, 0, 6,  0, 0, 9, 0},
+            { 0,16, 0, 0,  3, 0, 0, 6,  0, 0, 9, 0,  0,12, 0, 0},
+            { 4, 5, 6, 7,  8, 9,10,11, 12,13,14,15, 16, 1, 2, 3},
+            { 0, 0,10, 0,  0,13, 0, 0, 16, 0, 0, 3,  0, 0, 6, 0},
+            { 0,13, 0, 0, 16, 0, 0, 3,  0, 0, 6, 0,  0, 9, 0, 0},
+            {16, 0, 0, 3,  0, 0, 6, 0,  0, 9, 0, 0, 12, 0, 0,15}
+        };
+        OriginalGrid = new int[16, 16];
+        Message = null;
+    }
+
+    private void LoadExample2()
+    {
+        Grid = new int[16, 16]
+        {
+            { 1, 2, 3, 4,  5, 6, 7, 8,  9,10,11,12, 13,14,15,16},
+            { 5, 0, 0, 0,  0,10, 0, 0,  0, 0,15, 0,  0, 0, 0, 4},
+            { 9, 0, 0, 0,  0,14, 0, 0,  0, 0, 3, 0,  0, 0, 0, 8},
+            {13, 0, 0, 0,  0, 2, 0, 0,  0, 0, 7, 0,  0, 0, 0,12},
+            { 2, 0, 0, 0,  6, 7, 0, 0, 10, 0,12, 0, 14, 0, 0, 1},
+            { 6, 7, 8, 9, 10,11,12,13, 14,15,16, 1,  2, 3, 4, 5},
+            {10, 0, 0, 0,  0,15, 0, 0,  0, 0, 4, 0,  0, 0, 0, 9},
+            {14, 0, 0, 0,  0, 3, 0, 0,  0, 0, 8, 0,  0, 0, 0,13},
+            { 3, 0, 0, 0,  7, 8, 0, 0, 11, 0,13, 0, 15, 0, 0, 2},
+            { 7, 0, 0, 0,  0,12, 0, 0,  0, 0, 1, 0,  0, 0, 0, 6},
+            {11,12,13,14, 15,16, 1, 2,  3, 4, 5, 6,  7, 8, 9,10},
+            {15, 0, 0, 0,  0, 4, 0, 0,  0, 0, 9, 0,  0, 0, 0,14},
+            { 4, 0, 0, 0,  8, 9, 0, 0, 12, 0,14, 0, 16, 0, 0, 3},
+            { 8, 0, 0, 0,  0,13, 0, 0,  0, 0, 2, 0,  0, 0, 0, 7},
+            {12, 0, 0, 0,  0, 1, 0, 0,  0, 0, 6, 0,  0, 0, 0,11},
+            {16, 1, 2, 3,  4, 5, 6, 7,  8, 9,10,11, 12,13,14,15}
+        };
+        OriginalGrid = new int[16, 16];
+        Message = null;
+    }
+
+    // ==================== SALVATAGGIO/CARICAMENTO PUZZLE ====================
+
+    private async Task RefreshSavedPuzzlesList()
+    {
+        try
+        {
+            var list = await JS.InvokeAsync<List<Dictionary<string, object>>>("getSavedPuzzlesList", "16x16");
+            SavedPuzzles = list?.Select(p => new SavedPuzzleInfo(
+                p["key"]?.ToString() ?? "",
+                p["name"]?.ToString() ?? "",
+                DateTime.Parse(p["date"]?.ToString() ?? DateTime.Now.ToString())
+            )).ToList() ?? new List<SavedPuzzleInfo>();
+        }
+        catch
+        {
+            SavedPuzzles = new List<SavedPuzzleInfo>();
+        }
+    }
+
+    private async Task SaveCurrentPuzzle()
+    {
+        if (string.IsNullOrWhiteSpace(SaveName))
+        {
+            Message = "Inserisci un nome per il puzzle";
+            IsError = true;
+            return;
+        }
+
+        var gridList = new List<List<int>>();
+        for (int r = 0; r < Size; r++)
+        {
+            var row = new List<int>();
+            for (int c = 0; c < Size; c++)
+                row.Add(Grid[r, c]);
+            gridList.Add(row);
+        }
+
+        string key = $"puzzle_{DateTime.Now.Ticks}";
+        string gridJson = System.Text.Json.JsonSerializer.Serialize(gridList);
+
+        await JS.InvokeVoidAsync("savePuzzle", key, SaveName, gridJson, "16x16");
+        await RefreshSavedPuzzlesList();
+
+        Message = $"Puzzle '{SaveName}' salvato!";
+        IsError = false;
+        SaveName = "";
+    }
+
+    private async Task LoadSelectedPuzzle()
+    {
+        if (string.IsNullOrEmpty(SelectedPuzzleKey)) return;
+
+        try
+        {
+            var gridJson = await JS.InvokeAsync<string>("loadPuzzle", SelectedPuzzleKey);
+            if (string.IsNullOrEmpty(gridJson))
+            {
+                Message = "Puzzle non trovato";
+                IsError = true;
+                return;
+            }
+
+            var gridList = System.Text.Json.JsonSerializer.Deserialize<List<List<int>>>(gridJson);
+            if (gridList == null || gridList.Count != Size)
+            {
+                Message = "Formato puzzle non valido";
+                IsError = true;
+                return;
+            }
+
+            Grid = new int[Size, Size];
+            for (int r = 0; r < Size; r++)
+                for (int c = 0; c < Size; c++)
+                    Grid[r, c] = gridList[r][c];
+
+            OriginalGrid = new int[Size, Size];
+            Message = "Puzzle caricato!";
+            IsError = false;
+        }
+        catch (Exception ex)
+        {
+            Message = $"Errore nel caricamento: {ex.Message}";
+            IsError = true;
+        }
+    }
+
+    private async Task DeleteSelectedPuzzle()
+    {
+        if (string.IsNullOrEmpty(SelectedPuzzleKey)) return;
+
+        await JS.InvokeVoidAsync("deletePuzzle", SelectedPuzzleKey);
+        await RefreshSavedPuzzlesList();
+        SelectedPuzzleKey = "";
+        Message = "Puzzle eliminato";
+        IsError = false;
+    }
+
+    private async Task ExportPuzzle()
+    {
+        string name = string.IsNullOrWhiteSpace(SaveName) ? $"Sudoku_{DateTime.Now:yyyyMMdd_HHmm}" : SaveName;
+
+        var gridList = new List<List<int>>();
+        for (int r = 0; r < Size; r++)
+        {
+            var row = new List<int>();
+            for (int c = 0; c < Size; c++)
+                row.Add(Grid[r, c]);
+            gridList.Add(row);
+        }
+
+        string gridJson = System.Text.Json.JsonSerializer.Serialize(gridList);
+        await JS.InvokeVoidAsync("downloadPuzzle", name, gridJson, "16x16");
+
+        Message = $"Puzzle esportato come '{name}.json'";
+        IsError = false;
+    }
+
+    private async Task TriggerImport()
+    {
+        await JS.InvokeVoidAsync("triggerFileInput", "fileInput");
+    }
+
+    private async Task ImportPuzzle()
+    {
+        try
+        {
+            var content = await JS.InvokeAsync<string>("readFileContent", "fileInput");
+            if (string.IsNullOrEmpty(content))
+            {
+                return;
+            }
+
+            var doc = System.Text.Json.JsonDocument.Parse(content);
+            var root = doc.RootElement;
+
+            // Verifica tipo puzzle
+            if (root.TryGetProperty("type", out var typeEl) && typeEl.GetString() != "16x16")
+            {
+                Message = "Questo file non e' un puzzle 16x16";
+                IsError = true;
+                return;
+            }
+
+            // Leggi griglia
+            if (!root.TryGetProperty("grid", out var gridEl))
+            {
+                Message = "File non valido: manca la griglia";
+                IsError = true;
+                return;
+            }
+
+            var gridList = System.Text.Json.JsonSerializer.Deserialize<List<List<int>>>(gridEl.GetRawText());
+            if (gridList == null || gridList.Count != Size)
+            {
+                Message = "Formato griglia non valido";
+                IsError = true;
+                return;
+            }
+
+            Grid = new int[Size, Size];
+            for (int r = 0; r < Size; r++)
+                for (int c = 0; c < Size; c++)
+                    Grid[r, c] = gridList[r][c];
+
+            OriginalGrid = new int[Size, Size];
+
+            string name = root.TryGetProperty("name", out var nameEl) ? nameEl.GetString() ?? "Importato" : "Importato";
+            Message = $"Puzzle '{name}' importato!";
+            IsError = false;
+        }
+        catch (Exception ex)
+        {
+            Message = $"Errore nell'importazione: {ex.Message}";
+            IsError = true;
+        }
+    }
+}

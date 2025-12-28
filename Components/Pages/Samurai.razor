@@ -1,0 +1,471 @@
+@page "/samurai"
+@rendermode InteractiveServer
+
+<div class="container samurai-container">
+    <h1>Sudoku Samurai</h1>
+    <p class="subtitle">5 griglie 9x9 sovrapposte - Valori: 1-9</p>
+
+    <div class="samurai-grid">
+        @* Griglia composta: 21x21 con aree vuote *@
+        @for (int row = 0; row < 21; row++)
+        {
+            var r = row;
+            <div class="samurai-row">
+                @for (int col = 0; col < 21; col++)
+                {
+                    var c = col;
+                    var gridIndex = GetGridIndex(r, c);
+
+                    @if (gridIndex == -1)
+                    {
+                        <div class="samurai-cell empty-cell"></div>
+                    }
+                    else
+                    {
+                        var cellValue = Grid[r, c];
+                        var displayValue = cellValue == 0 ? "" : cellValue.ToString();
+                        var isOriginal = OriginalGrid[r, c] != 0;
+                        var isCurrentCell = (r == CurrentRow && c == CurrentCol);
+                        var cellClass = "samurai-cell";
+
+                        // Bordi box 3x3
+                        if (IsBoxBorderRight(r, c)) cellClass += " box-border-right";
+                        if (IsBoxBorderBottom(r, c)) cellClass += " box-border-bottom";
+
+                        // Colori per griglia
+                        cellClass += $" grid-{gridIndex}";
+
+                        if (isOriginal) cellClass += " original";
+                        else if (cellValue != 0) cellClass += " solved";
+                        if (isCurrentCell && IsSolving) cellClass += " current";
+
+                        <input type="text"
+                               value="@displayValue"
+                               maxlength="1"
+                               class="@cellClass"
+                               disabled="@IsSolving"
+                               @onchange="e => OnCellChange(r, c, e.Value?.ToString())" />
+                    }
+                }
+            </div>
+        }
+    </div>
+
+    <div class="speed-control">
+        <label>Velocità: </label>
+        <input type="range" min="1" max="100" @bind="Speed" @bind:event="oninput" />
+        <span>@Speed%</span>
+        @if (IsSolving)
+        {
+            <span class="steps-count">Passi: @StepCount</span>
+        }
+    </div>
+
+    <div class="buttons">
+        @if (!IsSolving)
+        {
+            <button class="btn btn-solve" @onclick="SolveAnimated">Risolvi</button>
+            <button class="btn btn-clear" @onclick="Clear">Pulisci</button>
+            <button class="btn btn-example" @onclick="LoadExample">Esempio</button>
+            <a href="/" class="btn btn-back">← Sudoku 16x16</a>
+        }
+        else
+        {
+            <button class="btn btn-clear" @onclick="StopSolving">Stop</button>
+        }
+    </div>
+
+    @if (Message != null)
+    {
+        <div class="message @(IsError ? "error" : "success")">
+            @Message
+        </div>
+    }
+</div>
+
+@code {
+    // Griglia 21x21 per Samurai (5 sudoku 9x9 sovrapposti)
+    private int[,] Grid = new int[21, 21];
+    private int[,] OriginalGrid = new int[21, 21];
+    private bool IsSolving = false;
+    private bool StopRequested = false;
+    private string? Message = null;
+    private bool IsError = false;
+    private int CurrentRow = -1;
+    private int CurrentCol = -1;
+    private int Speed = 50;
+    private int StepCount = 0;
+
+    // Bitmask per righe/colonne/box di ogni griglia
+    private int[,] RowMasks = new int[5, 9];
+    private int[,] ColMasks = new int[5, 9];
+    private int[,] BoxMasks = new int[5, 9];
+
+    private const int AllNumbersMask = 0x3FE; // Bits 1-9
+
+    // Mappa posizione -> indice griglia (0-4), -1 = vuoto
+    // Griglia 0: top-left, 1: top-right, 2: center, 3: bottom-left, 4: bottom-right
+    private int GetGridIndex(int row, int col)
+    {
+        // Top-left (0,0 - 8,8)
+        if (row >= 0 && row <= 8 && col >= 0 && col <= 8) return 0;
+        // Top-right (0,12 - 8,20)
+        if (row >= 0 && row <= 8 && col >= 12 && col <= 20) return 1;
+        // Center (6,6 - 14,14)
+        if (row >= 6 && row <= 14 && col >= 6 && col <= 14) return 2;
+        // Bottom-left (12,0 - 20,8)
+        if (row >= 12 && row <= 20 && col >= 0 && col <= 8) return 3;
+        // Bottom-right (12,12 - 20,20)
+        if (row >= 12 && row <= 20 && col >= 12 && col <= 20) return 4;
+
+        return -1; // Empty
+    }
+
+    // Ottiene le coordinate locali (0-8) per una griglia specifica
+    private (int localRow, int localCol) GetLocalCoords(int row, int col, int gridIndex)
+    {
+        return gridIndex switch
+        {
+            0 => (row, col),
+            1 => (row, col - 12),
+            2 => (row - 6, col - 6),
+            3 => (row - 12, col),
+            4 => (row - 12, col - 12),
+            _ => (-1, -1)
+        };
+    }
+
+    // Ottiene tutte le griglie a cui appartiene una cella (può essere più di una nelle sovrapposizioni)
+    private List<int> GetAllGridIndices(int row, int col)
+    {
+        var grids = new List<int>();
+
+        // Top-left
+        if (row >= 0 && row <= 8 && col >= 0 && col <= 8) grids.Add(0);
+        // Top-right
+        if (row >= 0 && row <= 8 && col >= 12 && col <= 20) grids.Add(1);
+        // Center
+        if (row >= 6 && row <= 14 && col >= 6 && col <= 14) grids.Add(2);
+        // Bottom-left
+        if (row >= 12 && row <= 20 && col >= 0 && col <= 8) grids.Add(3);
+        // Bottom-right
+        if (row >= 12 && row <= 20 && col >= 12 && col <= 20) grids.Add(4);
+
+        return grids;
+    }
+
+    private bool IsBoxBorderRight(int row, int col)
+    {
+        var grids = GetAllGridIndices(row, col);
+        foreach (var g in grids)
+        {
+            var (lr, lc) = GetLocalCoords(row, col, g);
+            if (lc % 3 == 2 && lc < 8) return true;
+        }
+        return false;
+    }
+
+    private bool IsBoxBorderBottom(int row, int col)
+    {
+        var grids = GetAllGridIndices(row, col);
+        foreach (var g in grids)
+        {
+            var (lr, lc) = GetLocalCoords(row, col, g);
+            if (lr % 3 == 2 && lr < 8) return true;
+        }
+        return false;
+    }
+
+    private void OnCellChange(int row, int col, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            Grid[row, col] = 0;
+            return;
+        }
+
+        var v = value.Trim();
+        if (int.TryParse(v, out int number) && number >= 1 && number <= 9)
+        {
+            Grid[row, col] = number;
+        }
+        else
+        {
+            Grid[row, col] = 0;
+        }
+    }
+
+    private async Task SolveAnimated()
+    {
+        Message = null;
+        IsSolving = true;
+        StopRequested = false;
+        StepCount = 0;
+        Array.Copy(Grid, OriginalGrid, Grid.Length);
+
+        if (!InitializeMasks())
+        {
+            Message = "La griglia iniziale contiene conflitti.";
+            IsError = true;
+            IsSolving = false;
+            return;
+        }
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        bool solved = await SolveWithAnimation();
+        stopwatch.Stop();
+
+        CurrentRow = -1;
+        CurrentCol = -1;
+        IsSolving = false;
+
+        if (StopRequested)
+        {
+            Message = $"Risoluzione interrotta dopo {StepCount} passi";
+            IsError = true;
+        }
+        else if (solved)
+        {
+            Message = $"Risolto in {stopwatch.ElapsedMilliseconds} ms ({StepCount} passi)!";
+            IsError = false;
+        }
+        else
+        {
+            Message = "Nessuna soluzione trovata.";
+            IsError = true;
+        }
+    }
+
+    private async Task<bool> SolveWithAnimation()
+    {
+        if (StopRequested) return false;
+
+        var nextCell = FindBestCell();
+        if (nextCell == null) return true;
+
+        int row = nextCell.Value.Row;
+        int col = nextCell.Value.Col;
+        int mask = nextCell.Value.Mask;
+
+        if (mask == 0) return false;
+
+        CurrentRow = row;
+        CurrentCol = col;
+
+        for (int num = 1; num <= 9; num++)
+        {
+            if ((mask & (1 << num)) == 0) continue;
+            if (StopRequested) return false;
+
+            StepCount++;
+
+            if (CanPlace(row, col, num))
+            {
+                SetNumber(row, col, num);
+
+                int delay = Math.Max(1, (int)(100 * (1.0 - Speed / 100.0)));
+                await Task.Delay(delay);
+                StateHasChanged();
+
+                if (await SolveWithAnimation())
+                    return true;
+
+                ClearNumber(row, col, num);
+
+                if (Speed < 95)
+                {
+                    await Task.Delay(delay / 2);
+                    StateHasChanged();
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool InitializeMasks()
+    {
+        RowMasks = new int[5, 9];
+        ColMasks = new int[5, 9];
+        BoxMasks = new int[5, 9];
+
+        for (int row = 0; row < 21; row++)
+        {
+            for (int col = 0; col < 21; col++)
+            {
+                int num = Grid[row, col];
+                if (num == 0) continue;
+
+                var grids = GetAllGridIndices(row, col);
+                if (grids.Count == 0) continue;
+
+                foreach (var g in grids)
+                {
+                    var (lr, lc) = GetLocalCoords(row, col, g);
+                    int bit = 1 << num;
+                    int box = (lr / 3) * 3 + (lc / 3);
+
+                    if ((RowMasks[g, lr] & bit) != 0 ||
+                        (ColMasks[g, lc] & bit) != 0 ||
+                        (BoxMasks[g, box] & bit) != 0)
+                        return false;
+
+                    RowMasks[g, lr] |= bit;
+                    ColMasks[g, lc] |= bit;
+                    BoxMasks[g, box] |= bit;
+                }
+            }
+        }
+        return true;
+    }
+
+    private bool CanPlace(int row, int col, int num)
+    {
+        var grids = GetAllGridIndices(row, col);
+        int bit = 1 << num;
+
+        foreach (var g in grids)
+        {
+            var (lr, lc) = GetLocalCoords(row, col, g);
+            int box = (lr / 3) * 3 + (lc / 3);
+
+            if ((RowMasks[g, lr] & bit) != 0 ||
+                (ColMasks[g, lc] & bit) != 0 ||
+                (BoxMasks[g, box] & bit) != 0)
+                return false;
+        }
+        return true;
+    }
+
+    private void SetNumber(int row, int col, int num)
+    {
+        Grid[row, col] = num;
+        var grids = GetAllGridIndices(row, col);
+        int bit = 1 << num;
+
+        foreach (var g in grids)
+        {
+            var (lr, lc) = GetLocalCoords(row, col, g);
+            int box = (lr / 3) * 3 + (lc / 3);
+            RowMasks[g, lr] |= bit;
+            ColMasks[g, lc] |= bit;
+            BoxMasks[g, box] |= bit;
+        }
+    }
+
+    private void ClearNumber(int row, int col, int num)
+    {
+        Grid[row, col] = 0;
+        var grids = GetAllGridIndices(row, col);
+        int bit = 1 << num;
+
+        foreach (var g in grids)
+        {
+            var (lr, lc) = GetLocalCoords(row, col, g);
+            int box = (lr / 3) * 3 + (lc / 3);
+            RowMasks[g, lr] &= ~bit;
+            ColMasks[g, lc] &= ~bit;
+            BoxMasks[g, box] &= ~bit;
+        }
+    }
+
+    private int GetAvailableMask(int row, int col)
+    {
+        var grids = GetAllGridIndices(row, col);
+        int available = AllNumbersMask;
+
+        foreach (var g in grids)
+        {
+            var (lr, lc) = GetLocalCoords(row, col, g);
+            int box = (lr / 3) * 3 + (lc / 3);
+            int used = RowMasks[g, lr] | ColMasks[g, lc] | BoxMasks[g, box];
+            available &= ~used;
+        }
+        return available & AllNumbersMask;
+    }
+
+    private (int Row, int Col, int Mask)? FindBestCell()
+    {
+        int bestCount = int.MaxValue;
+        (int Row, int Col, int Mask)? best = null;
+
+        for (int row = 0; row < 21; row++)
+        {
+            for (int col = 0; col < 21; col++)
+            {
+                if (GetGridIndex(row, col) == -1) continue;
+                if (Grid[row, col] != 0) continue;
+
+                int mask = GetAvailableMask(row, col);
+                int count = CountBits(mask);
+
+                if (count == 0) return (row, col, 0);
+
+                if (count < bestCount)
+                {
+                    bestCount = count;
+                    best = (row, col, mask);
+                    if (count == 1) return best;
+                }
+            }
+        }
+        return best;
+    }
+
+    private static int CountBits(int value)
+    {
+        int count = 0;
+        while (value != 0) { value &= value - 1; count++; }
+        return count;
+    }
+
+    private void StopSolving() => StopRequested = true;
+
+    private void Clear()
+    {
+        Grid = new int[21, 21];
+        OriginalGrid = new int[21, 21];
+        Message = null;
+    }
+
+    private void LoadExample()
+    {
+        Clear();
+
+        // Esempio Samurai semplificato - pochi numeri iniziali per evitare conflitti
+        // Top-left grid (0,0 - 8,8) - solo prime righe lontane dalla sovrapposizione
+        Grid[0, 0] = 5; Grid[0, 4] = 6; Grid[0, 8] = 8;
+        Grid[1, 2] = 3; Grid[1, 6] = 7;
+        Grid[2, 1] = 9; Grid[2, 5] = 1;
+        Grid[3, 0] = 8; Grid[3, 3] = 4;
+        Grid[4, 4] = 9; Grid[4, 7] = 2;
+
+        // Top-right grid (0,12 - 8,20) - solo prime righe lontane dalla sovrapposizione
+        Grid[0, 12] = 9; Grid[0, 16] = 2; Grid[0, 20] = 4;
+        Grid[1, 14] = 5; Grid[1, 18] = 7;
+        Grid[2, 13] = 3; Grid[2, 17] = 1;
+        Grid[3, 12] = 4; Grid[3, 19] = 8;
+        Grid[4, 15] = 6;
+
+        // Bottom-left grid (12,0 - 20,8) - solo ultime righe lontane dalla sovrapposizione
+        Grid[16, 0] = 3; Grid[16, 4] = 5;
+        Grid[17, 2] = 4; Grid[17, 6] = 7;
+        Grid[18, 1] = 9; Grid[18, 5] = 2;
+        Grid[19, 3] = 5; Grid[19, 8] = 8;
+        Grid[20, 0] = 2; Grid[20, 4] = 4; Grid[20, 7] = 6;
+
+        // Bottom-right grid (12,12 - 20,20) - solo ultime righe lontane dalla sovrapposizione
+        Grid[16, 12] = 7; Grid[16, 16] = 4;
+        Grid[17, 14] = 5; Grid[17, 18] = 6;
+        Grid[18, 13] = 8; Grid[18, 17] = 2;
+        Grid[19, 12] = 4; Grid[19, 20] = 9;
+        Grid[20, 15] = 1; Grid[20, 19] = 7;
+
+        // Center grid (6,6 - 14,14) - solo centro lontano dalle sovrapposizioni
+        Grid[9, 9] = 5;
+        Grid[10, 10] = 9;
+        Grid[11, 11] = 3;
+
+        Message = null;
+    }
+}
